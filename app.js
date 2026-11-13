@@ -7,6 +7,7 @@ const status=t=>{$('status').textContent=t};
 const answer=t=>{$('answer').textContent=t};
 async function initDb(){return new Promise((resolve,reject)=>{const r=indexedDB.open('cameron-assist-v04',1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains('docs'))r.result.createObjectStore('docs',{keyPath:'id'})};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
 const store=(mode='readonly')=>db.transaction('docs',mode).objectStore('docs');
+let activeBrowserUtterance=null;
 let loadingPDF;
 async function pdfLib(){if(window.pdfjsLib)return pdfjsLib;if(!loadingPDF)loadingPDF=new Promise((ok,no)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';s.onload=()=>{pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';ok(pdfjsLib)};s.onerror=()=>no(Error('PDF-Bibliothek konnte nicht geladen werden.'));document.head.append(s)});return loadingPDF}
 async function getPDF(d){if(pdfCache.has(d.id))return pdfCache.get(d.id);const lib=await pdfLib();const p=await lib.getDocument({data:new Uint8Array(d.bytes.slice(0))}).promise;pdfCache.set(d.id,p);return p}
@@ -66,9 +67,39 @@ async function zoomOut(){
  if(fitStep){fitStep=0;await render();return}
  status('Die kleinste Ansicht ist erreicht.');
 }
-function stop(){sequence++;if(activeAudio){activeAudio.pause();activeAudio=null}speechSynthesis?.cancel()}
-function browserSpeak(text){if(!('speechSynthesis' in window))return status('Keine Sprachausgabe verfügbar.');const u=new SpeechSynthesisUtterance(text.slice(0,10000));u.lang='de-DE';u.rate=speechSpeed;speechSynthesis.speak(u)}
-async function speak(text){if(!text.trim())return status('Kein auslesbarer Text. Gescannte Seiten benötigen OCR.');stop();const ticket=sequence;const chunks=text.match(/[\s\S]{1,1400}/g)||[];for(const chunk of chunks){if(ticket!==sequence)return;try{const r=await fetch(API+'/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:chunk,speed:speechSpeed})});if(!r.ok)throw Error('HTTP '+r.status);const blob=await r.blob();if(ticket!==sequence)return;const url=URL.createObjectURL(blob),audio=new Audio(url);activeAudio=audio;try{await new Promise((resolve,reject)=>{audio.onended=resolve;audio.onerror=()=>reject(Error('Audiofehler'));audio.play().catch(reject)})}finally{URL.revokeObjectURL(url);if(activeAudio===audio)activeAudio=null}}catch(e){status('Grok-Stimme derzeit nicht verfügbar. Browserstimme wird verwendet.');browserSpeak(chunk);return}}}
+function stop(){sequence++;if(activeAudio){activeAudio.pause();activeAudio=null}activeBrowserUtterance=null;if('speechSynthesis' in window)speechSynthesis.cancel()}
+function browserSpeak(text){if(!('speechSynthesis' in window))return status('Keine Sprachausgabe verfügbar.');const u=new SpeechSynthesisUtterance(text.slice(0,10000));u.lang='de-DE';u.rate=speechSpeed;activeBrowserUtterance=u;u.onend=()=>{if(activeBrowserUtterance===u)activeBrowserUtterance=null};speechSynthesis.speak(u)}
+// Kleine erste Einheit: die Stimme beginnt schneller, während der Rest nacheinander geladen wird.
+function speechChunks(text){
+ const result=[];let rest=text.trim();
+ while(rest){const limit=result.length===0?220:1100;
+  if(rest.length<=limit){result.push(rest);break}
+  let cut=rest.lastIndexOf(' ',limit);if(cut<limit*.45)cut=limit;
+  result.push(rest.slice(0,cut).trim());rest=rest.slice(cut).trim();
+ }
+ return result;
+}
+async function speak(text){
+ if(!text.trim())return status('Kein auslesbarer Text. Gescannte Seiten benötigen OCR.');
+ stop();const ticket=sequence;const chunks=speechChunks(text);
+ status('Cameron bereitet die Stimme vor …');
+ for(const chunk of chunks){
+  if(ticket!==sequence)return;
+  try{
+   // Neutral generieren; Tempo wird lokal gesteuert und reagiert während des Vorlesens.
+   const r=await fetch(API+'/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:chunk,speed:1})});
+   if(!r.ok)throw Error('HTTP '+r.status);
+   const blob=await r.blob();if(ticket!==sequence)return;
+   const url=URL.createObjectURL(blob),audio=new Audio(url);
+   activeAudio=audio;audio.playbackRate=speechSpeed;
+   try{status('Cameron liest vor …');await new Promise((resolve,reject)=>{
+    audio.onended=resolve;audio.onerror=()=>reject(Error('Audiofehler'));
+    audio.play().catch(reject);
+   })}finally{URL.revokeObjectURL(url);if(activeAudio===audio)activeAudio=null}
+  }catch(e){if(ticket!==sequence)return;status('Grok-Stimme derzeit nicht verfügbar. Browserstimme wird verwendet.');browserSpeak(chunk);return}
+ }
+ if(ticket===sequence)status('Vorlesen beendet.');
+}
 async function contextText(q){const m=q.match(/(?:seite|page)\s*(\d+)/i);if(m){const n=Number(m[1]);if(n<1||n>current.pages)throw Error('Diese Seite existiert nicht.');page=n;await render()}const requestedWhole=/gesamten|ganzen|ganze dokument|alles|zusammenfass|worum|was ist das/i.test(q);if(!requestedWhole||current.type!=='pdf')return {text:readable,page};let texts=[],length=0;for(let n=1;n<=current.pages;n++){const t=await pageText(current,n);if(length+t.length>20000)break;texts.push('Seite '+n+': '+t);length+=t.length}return {text:texts.join('\n\n'),page:'mehrere'}}
 async function askQuestion(q){if(!current)return answer('Bitte öffne zuerst ein Dokument.');if(!q)return;answer('Cameron liest dein Dokument …');try{const context=await contextText(q);if(!context.text.trim())return answer('Die Seite ist sichtbar, enthält aber keinen auslesbaren Text. Für Scans brauchen wir OCR.');const r=await fetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,documentName:current.name,page:context.page,context:context.text})});const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.error||'KI momentan nicht erreichbar');const reply=String(data.answer||'Keine Antwort erhalten.');answer(reply);if(mode==='reading'&&/fasse|zusammenfass/i.test(q)){summaryText=reply;summaryDoc=current.id;const el=$('page').querySelector('.optimized');if(el){el.textContent=reply;applyReadingStyle()}}await speak(reply)}catch(e){answer('Ich kann diese Frage gerade nicht beantworten: '+e.message)}}
 async function summarize(){if(!current)return status('Bitte zuerst ein Dokument öffnen.');$('question').value='Fasse das gesamte Dokument in einfacher Sprache zusammen. Erhalte wichtige Beträge, Daten und Fristen.';await ask()}
@@ -80,7 +111,7 @@ async function printOptimized(){
  const isText=mode==='reading'||viewReflow||current.type!=='pdf';
  const v=readingValues(),fontUrl=new URL('fonts/OpenDyslexic-Regular.otf',document.baseURI).href,fontBoldUrl=new URL('fonts/OpenDyslexic-Bold.otf',document.baseURI).href;
  const fontCss=`@font-face{font-family:OpenDyslexic;src:url("${fontUrl}") format("opentype");font-weight:400}@font-face{font-family:OpenDyslexic;src:url("${fontBoldUrl}") format("opentype");font-weight:700}`;
- const common=`${fontCss}@page{size:A4;margin:14mm}*{box-sizing:border-box}body{margin:0;font-family:${isText?v.font:'Arial,sans-serif'};font-size:${isText?v.size:24*textScale}px;line-height:${isText?v.line:1.65};background:${isText?v.bg:'#fff'};color:${isText?v.fg:'#222'};overflow-wrap:anywhere}h1{font:700 16px Arial;margin:0 0 12px}article{white-space:pre-wrap;overflow-wrap:anywhere}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}`;
+ const common=`${fontCss}@page{size:A4;margin:14mm}*{box-sizing:border-box}body{margin:0;font-family:${mode==='reading'?v.font:'Arial,Verdana,sans-serif'};font-size:${mode==='reading'?v.size:24*textScale}px;line-height:${mode==='reading'?v.line:1.65};background:${mode==='reading'?v.bg:'#fff'};color:${mode==='reading'?v.fg:'#222'};overflow-wrap:anywhere}h1{font:700 16px Arial;margin:0 0 12px}article{white-space:pre-wrap;overflow-wrap:anywhere}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}`;
  let content='';
  if(isText){const text=mode==='reading'&&summaryDoc===current.id&&summaryText?summaryText:mode==='reading'?await allText():current.type==='pdf'?await pageText(current,page):current.text||'';
   if(!text.trim()){popup.close();return status('Kein auslesbarer Text. Gescannte Seiten benötigen OCR.')}content='<h1>'+escape(current.name)+'</h1><article>'+escape(text)+'</article>';
@@ -100,6 +131,6 @@ async function printOptimized(){
  popup.focus();popup.print();
 }
 async function ask(){const q=$('question').value.trim();if(!q)return;if(!consent){waitingQuestion=q;$('consent').hidden=false;return}await askQuestion(q)}
-$('file').addEventListener('change',e=>upload(e.target.files));$('doc').addEventListener('change',async e=>{current=docs.find(d=>d.id===e.target.value)||null;page=1;resetView();await render()});$('prev').onclick=async()=>{page--;await render()};$('next').onclick=async()=>{page++;await render()};$('zoomin').onclick=zoomIn;$('zoomout').onclick=zoomOut;$('read').onclick=()=>speak(readable);$('stop').onclick=stop;$('modeVision').onclick=()=>setMode('vision');$('modeReading').onclick=()=>setMode('reading');$('summary').onclick=summarize;$('export').onclick=printOptimized;for(const id of ['readingFont','fontSize','lineSpace','paperColor'])$(id).addEventListener('change',()=>{applyReadingStyle();status('Leseansicht aktualisiert – diese Einstellungen werden auch gedruckt.')});$('speechSpeed').onchange=e=>speechSpeed=Number(e.target.value);$('ask').onclick=ask;$('question').addEventListener('keydown',e=>{if(e.key==='Enter')ask()});$('cancelConsent').onclick=()=>{$('consent').hidden=true;waitingQuestion=null};$('agreeConsent').onclick=()=>{consent=true;$('consent').hidden=true;if(waitingQuestion)askQuestion(waitingQuestion);waitingQuestion=null};$('mic').onclick=()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return status('Spracherkennung ist in diesem Browser nicht verfügbar. Bitte tippe deine Frage.');const r=new SR();r.lang='de-DE';r.onresult=e=>{$('question').value=e.results[0][0].transcript;ask()};r.onerror=()=>status('Mikrofon konnte nicht gestartet werden.');r.start()};
+$('file').addEventListener('change',e=>upload(e.target.files));$('doc').addEventListener('change',async e=>{current=docs.find(d=>d.id===e.target.value)||null;page=1;resetView();await render()});$('prev').onclick=async()=>{page--;await render()};$('next').onclick=async()=>{page++;await render()};$('zoomin').onclick=zoomIn;$('zoomout').onclick=zoomOut;$('read').onclick=()=>speak(readable);$('stop').onclick=stop;$('modeVision').onclick=()=>setMode('vision');$('modeReading').onclick=()=>setMode('reading');$('summary').onclick=summarize;$('export').onclick=printOptimized;for(const id of ['readingFont','fontSize','lineSpace','paperColor'])$(id).addEventListener('change',()=>{applyReadingStyle();status('Leseansicht aktualisiert – diese Einstellungen werden auch gedruckt.')});$('speechSpeed').onchange=e=>{speechSpeed=Number(e.target.value);if(activeAudio)activeAudio.playbackRate=speechSpeed;if(activeBrowserUtterance){status('Browserstimme übernimmt das neue Tempo beim nächsten Vorlesen.')}else if(activeAudio){status('Sprechtempo sofort angepasst.')}};$('ask').onclick=ask;$('question').addEventListener('keydown',e=>{if(e.key==='Enter')ask()});$('cancelConsent').onclick=()=>{$('consent').hidden=true;waitingQuestion=null};$('agreeConsent').onclick=()=>{consent=true;$('consent').hidden=true;if(waitingQuestion)askQuestion(waitingQuestion);waitingQuestion=null};$('mic').onclick=()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return status('Spracherkennung ist in diesem Browser nicht verfügbar. Bitte tippe deine Frage.');const r=new SR();r.lang='de-DE';r.onresult=e=>{$('question').value=e.results[0][0].transcript;ask()};r.onerror=()=>status('Mikrofon konnte nicht gestartet werden.');r.start()};
 const area=$('page');area.addEventListener('dragover',e=>{e.preventDefault()});area.addEventListener('drop',e=>{e.preventDefault();upload(e.dataTransfer.files)});
 initDb().then(async d=>{db=d;await updateDocs()}).catch(e=>status('Browser-Speicher nicht verfügbar: '+e.message));
