@@ -22,7 +22,7 @@ function fitPageWidth(){const target=$('page');return Math.max(240,target.client
 
 async function render(){
  const ticket=++renderSeq,target=$('page');target.replaceChildren();readable='';
- if(!current){$('docname').textContent='Dein Dokument erscheint hier';$('pagecount').textContent='–';target.innerHTML='<div class="empty"><span>📄</span><p>Öffne ein PDF oder einen Text.</p><p class="secondary">Du kannst die Datei auch hierher ziehen.</p></div>';return}
+ if(!current){$('docname').textContent='Dein Dokument erscheint hier';$('pagecount').textContent='–';target.innerHTML='<div class="empty"><svg class="ic" aria-hidden="true"><use href="#i-doc"/></svg><p>Öffne ein PDF oder einen Text.</p><p class="secondary">Du kannst die Datei auch hierher ziehen.</p></div>';return}
  page=Math.max(1,Math.min(page,current.pages||1));$('docname').textContent=current.name;$('pagecount').textContent=page+' / '+current.pages;
  try{
   if(mode==='reading'||viewReflow){
@@ -67,8 +67,9 @@ async function zoomOut(){
  if(fitStep){fitStep=0;await render();return}
  status('Die kleinste Ansicht ist erreicht.');
 }
-function stop(){sequence++;if(activeAudio){activeAudio.pause();activeAudio=null}activeBrowserUtterance=null;if('speechSynthesis' in window)speechSynthesis.cancel()}
-function browserSpeak(text){if(!('speechSynthesis' in window))return status('Keine Sprachausgabe verfügbar.');const u=new SpeechSynthesisUtterance(text.slice(0,10000));u.lang='de-DE';u.rate=speechSpeed;activeBrowserUtterance=u;u.onend=()=>{if(activeBrowserUtterance===u)activeBrowserUtterance=null};speechSynthesis.speak(u)}
+const speaking=on=>document.body.classList.toggle('speaking',on);
+function stop(){sequence++;speaking(false);if(activeAudio){activeAudio.pause();activeAudio=null}activeBrowserUtterance=null;if('speechSynthesis' in window)speechSynthesis.cancel()}
+function browserSpeak(text){if(!('speechSynthesis' in window))return status('Keine Sprachausgabe verfügbar.');const u=new SpeechSynthesisUtterance(text.slice(0,10000));u.lang='de-DE';u.rate=speechSpeed;activeBrowserUtterance=u;u.onend=u.onerror=()=>{if(activeBrowserUtterance===u){activeBrowserUtterance=null;speaking(false)}};speaking(true);speechSynthesis.speak(u)}
 // Kleine erste Einheit: die Stimme beginnt schneller, während der Rest nacheinander geladen wird.
 function speechChunks(text){
  const result=[];let rest=text.trim();
@@ -81,9 +82,9 @@ function speechChunks(text){
 }
 async function speak(text){
  if(!text.trim())return status('Kein auslesbarer Text. Gescannte Seiten benötigen OCR.');
- stop();const ticket=sequence;const chunks=speechChunks(text);
+ stop();const ticket=sequence;const chunks=speechChunks(text);speaking(true);
  status('Cameron bereitet die Stimme vor …');
- for(const chunk of chunks){
+ for(const [index,chunk] of chunks.entries()){
   if(ticket!==sequence)return;
   try{
    // Neutral generieren; Tempo wird lokal gesteuert und reagiert während des Vorlesens.
@@ -93,15 +94,15 @@ async function speak(text){
    const url=URL.createObjectURL(blob),audio=new Audio(url);
    activeAudio=audio;audio.playbackRate=speechSpeed;
    try{status('Cameron liest vor …');await new Promise((resolve,reject)=>{
-    audio.onended=resolve;audio.onerror=()=>reject(Error('Audiofehler'));
+    audio.onended=audio.onpause=resolve;audio.onerror=()=>reject(Error('Audiofehler'));
     audio.play().catch(reject);
    })}finally{URL.revokeObjectURL(url);if(activeAudio===audio)activeAudio=null}
-  }catch(e){if(ticket!==sequence)return;status('Grok-Stimme derzeit nicht verfügbar. Browserstimme wird verwendet.');browserSpeak(chunk);return}
+  }catch(e){if(ticket!==sequence)return;status('Grok-Stimme derzeit nicht verfügbar. Browserstimme wird verwendet.');browserSpeak(chunks.slice(index).join(' '));return}
  }
- if(ticket===sequence)status('Vorlesen beendet.');
+ if(ticket===sequence){speaking(false);status('Vorlesen beendet.')}
 }
-async function contextText(q){const m=q.match(/(?:seite|page)\s*(\d+)/i);if(m){const n=Number(m[1]);if(n<1||n>current.pages)throw Error('Diese Seite existiert nicht.');page=n;await render()}const requestedWhole=/gesamten|ganzen|ganze dokument|alles|zusammenfass|worum|was ist das/i.test(q);if(!requestedWhole||current.type!=='pdf')return {text:readable,page};let texts=[],length=0;for(let n=1;n<=current.pages;n++){const t=await pageText(current,n);if(length+t.length>20000)break;texts.push('Seite '+n+': '+t);length+=t.length}return {text:texts.join('\n\n'),page:'mehrere'}}
-async function askQuestion(q){if(!current)return answer('Bitte öffne zuerst ein Dokument.');if(!q)return;answer('Cameron liest dein Dokument …');try{const context=await contextText(q);if(!context.text.trim())return answer('Die Seite ist sichtbar, enthält aber keinen auslesbaren Text. Für Scans brauchen wir OCR.');const r=await fetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,documentName:current.name,page:context.page,context:context.text})});const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.error||'KI momentan nicht erreichbar');const reply=String(data.answer||'Keine Antwort erhalten.');answer(reply);if(mode==='reading'&&/fasse|zusammenfass/i.test(q)){summaryText=reply;summaryDoc=current.id;const el=$('page').querySelector('.optimized');if(el){el.textContent=reply;applyReadingStyle()}}await speak(reply)}catch(e){answer('Ich kann diese Frage gerade nicht beantworten: '+e.message)}}
+async function contextText(q){const m=q.match(/(?:seite|page)\s*(\d+)/i);if(m){const n=Number(m[1]);if(n<1||n>current.pages)throw Error('Diese Seite existiert nicht.');page=n;await render()}const requestedWhole=/gesamten|ganzen|ganze dokument|alles|zusammenfass|worum|was ist das/i.test(q);if(current.type!=='pdf')return {text:(current.text||'').slice(0,20000),page};if(!requestedWhole&&mode!=='reading')return {text:readable.slice(0,20000),page};let texts=[],length=0;for(let n=1;n<=current.pages;n++){const t=await pageText(current,n);if(length+t.length>20000)break;texts.push('Seite '+n+': '+t);length+=t.length}return {text:texts.join('\n\n'),page:'mehrere'}}
+async function askQuestion(q){if(!current)return answer('Bitte öffne zuerst ein Dokument.');if(!q)return;answer('Cameron liest dein Dokument …');$('answer').classList.add('busy');try{const context=await contextText(q);if(!context.text.trim())return answer('Die Seite ist sichtbar, enthält aber keinen auslesbaren Text. Für Scans brauchen wir OCR.');const r=await fetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,documentName:current.name,page:context.page,context:context.text})});const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.error||'KI momentan nicht erreichbar');const reply=String(data.answer||'Keine Antwort erhalten.');answer(reply);if(mode==='reading'&&/fasse|zusammenfass/i.test(q)){summaryText=reply;summaryDoc=current.id;const el=$('page').querySelector('.optimized');if(el){el.textContent=reply;readable=reply;applyReadingStyle()}}$('answer').classList.remove('busy');await speak(reply)}catch(e){answer('Ich kann diese Frage gerade nicht beantworten: '+e.message)}finally{$('answer').classList.remove('busy')}}
 async function summarize(){if(!current)return status('Bitte zuerst ein Dokument öffnen.');$('question').value='Fasse das gesamte Dokument in einfacher Sprache zusammen. Erhalte wichtige Beträge, Daten und Fristen.';await ask()}
 function setMode(next){mode=next;resetView();summaryText='';summaryDoc='';for(const [id,value] of [['modeVision','vision'],['modeReading','reading']]){$(id).classList.toggle('active',next===value);$(id).setAttribute('aria-pressed',String(next===value))}for(const id of ['fontLabel','sizeLabel','spaceLabel','colorLabel'])$(id).hidden=next!=='reading';render()}
 async function printOptimized(){
@@ -131,6 +132,10 @@ async function printOptimized(){
  popup.focus();popup.print();
 }
 async function ask(){const q=$('question').value.trim();if(!q)return;if(!consent){waitingQuestion=q;$('consent').hidden=false;return}await askQuestion(q)}
-$('file').addEventListener('change',e=>upload(e.target.files));$('doc').addEventListener('change',async e=>{current=docs.find(d=>d.id===e.target.value)||null;page=1;resetView();await render()});$('prev').onclick=async()=>{page--;await render()};$('next').onclick=async()=>{page++;await render()};$('zoomin').onclick=zoomIn;$('zoomout').onclick=zoomOut;$('read').onclick=()=>speak(readable);$('stop').onclick=stop;$('modeVision').onclick=()=>setMode('vision');$('modeReading').onclick=()=>setMode('reading');$('summary').onclick=summarize;$('export').onclick=printOptimized;for(const id of ['readingFont','fontSize','lineSpace','paperColor'])$(id).addEventListener('change',()=>{applyReadingStyle();status('Leseansicht aktualisiert – diese Einstellungen werden auch gedruckt.')});$('speechSpeed').onchange=e=>{speechSpeed=Number(e.target.value);if(activeAudio)activeAudio.playbackRate=speechSpeed;if(activeBrowserUtterance){status('Browserstimme übernimmt das neue Tempo beim nächsten Vorlesen.')}else if(activeAudio){status('Sprechtempo sofort angepasst.')}};$('ask').onclick=ask;$('question').addEventListener('keydown',e=>{if(e.key==='Enter')ask()});$('cancelConsent').onclick=()=>{$('consent').hidden=true;waitingQuestion=null};$('agreeConsent').onclick=()=>{consent=true;$('consent').hidden=true;if(waitingQuestion)askQuestion(waitingQuestion);waitingQuestion=null};$('mic').onclick=()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return status('Spracherkennung ist in diesem Browser nicht verfügbar. Bitte tippe deine Frage.');const r=new SR();r.lang='de-DE';r.onresult=e=>{$('question').value=e.results[0][0].transcript;ask()};r.onerror=()=>status('Mikrofon konnte nicht gestartet werden.');r.start()};
-const area=$('page');area.addEventListener('dragover',e=>{e.preventDefault()});area.addEventListener('drop',e=>{e.preventDefault();upload(e.dataTransfer.files)});
+$('file').addEventListener('change',async e=>{await upload([...e.target.files]);e.target.value=''});document.querySelector('.upload').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('file').click()}});$('doc').addEventListener('change',async e=>{current=docs.find(d=>d.id===e.target.value)||null;page=1;resetView();await render()});$('prev').onclick=async()=>{page--;await render()};$('next').onclick=async()=>{page++;await render()};$('zoomin').onclick=zoomIn;$('zoomout').onclick=zoomOut;$('read').onclick=()=>speak(readable);$('stop').onclick=()=>{stop();status('Vorlesen gestoppt.')};$('modeVision').onclick=()=>setMode('vision');$('modeReading').onclick=()=>setMode('reading');$('summary').onclick=summarize;$('export').onclick=printOptimized;for(const id of ['readingFont','fontSize','lineSpace','paperColor'])$(id).addEventListener('change',()=>{applyReadingStyle();status('Leseansicht aktualisiert – diese Einstellungen werden auch gedruckt.')});$('speechSpeed').onchange=e=>{speechSpeed=Number(e.target.value);if(activeAudio)activeAudio.playbackRate=speechSpeed;if(activeBrowserUtterance){status('Browserstimme übernimmt das neue Tempo beim nächsten Vorlesen.')}else if(activeAudio){status('Sprechtempo sofort angepasst.')}};$('ask').onclick=ask;$('question').addEventListener('keydown',e=>{if(e.key==='Enter')ask()});$('cancelConsent').onclick=()=>{$('consent').hidden=true;waitingQuestion=null};$('agreeConsent').onclick=()=>{consent=true;$('consent').hidden=true;if(waitingQuestion)askQuestion(waitingQuestion);waitingQuestion=null};$('mic').onclick=()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return status('Spracherkennung ist in diesem Browser nicht verfügbar. Bitte tippe deine Frage.');const r=new SR();r.lang='de-DE';r.onstart=()=>$('mic').classList.add('listening');r.onend=()=>$('mic').classList.remove('listening');r.onresult=e=>{$('question').value=e.results[0][0].transcript;ask()};r.onerror=()=>status('Mikrofon konnte nicht gestartet werden.');r.start()};
+const area=$('page');area.addEventListener('dragover',e=>{e.preventDefault();area.classList.add('dragging')});area.addEventListener('dragleave',()=>area.classList.remove('dragging'));area.addEventListener('drop',e=>{e.preventDefault();e.stopPropagation();area.classList.remove('dragging');upload([...e.dataTransfer.files])});
+// Datei neben das Feld gezogen: nicht die App durch die Datei ersetzen.
+for(const type of ['dragover','drop'])window.addEventListener(type,e=>e.preventDefault());
+// Fenstergröße geändert: PDF-Seite neu einpassen.
+let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(current&&current.type==='pdf'&&mode==='vision'&&!viewReflow)render()},200)});
 initDb().then(async d=>{db=d;await updateDocs()}).catch(e=>status('Browser-Speicher nicht verfügbar: '+e.message));
